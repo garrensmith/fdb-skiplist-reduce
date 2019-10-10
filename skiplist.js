@@ -14,18 +14,32 @@ const MAX_LEVELS = 6;
 const LEVEL_FAN_POW = 1; // 2^X per level or (1 / 2^X) less than previous level
 const END = 0xFF;
 
-const keys = [
-    [2017, 03, 1],
-    [2017, 04, 1],
-    [2017, 04, 15],
-    [2017, 05, 1],
-    [2018, 03, 1],
-    [2018, 04, 1],
-    [2018, 05, 1],
-    [2019, 03, 1],
-    [2019, 04, 1],
-    [2019, 05, 1]
-].map(k => JSON.stringify(k));
+// const keys = [
+//     [2017, 03, 1],
+
+//     [2017, 04, 1],
+//     [2017, 04, 15],
+//     [2017, 05, 1],
+//     [2018, 03, 1],
+//     [2018, 04, 1],
+//     [2018, 05, 1],
+//     [2019, 03, 1],
+//     [2019, 04, 1],
+//     [2019, 05, 1]
+// ].map(k => JSON.stringify(k));
+
+const kvs = [
+    ['[2017,3,1]', 9],
+    ['[2017,4,15]', 6],
+    ['[2017,4,1]', 7],
+    ['[2017,5,1]', 9],
+    ['[2018,3,1]', 6],
+    ['[2018,4,1]', 7],
+    ['[2018,5,1]', 7],
+    ['[2019,3,1]', 4],
+    ['[2019,4,1]', 6],
+    ['[2019,5,1]', 7]
+  ]
 
 // UTILS
 
@@ -77,8 +91,8 @@ const create = async () => {
     });
 
     console.log('setup done');
-    for (key of keys) {
-        await insert(key, getRandom(1, 10));
+    for ([key, val] of kvs) {
+        await insert(key, val);
     }
 };
 
@@ -127,6 +141,28 @@ const getRange = async (tn, start, end, level) => {
     });
 };
 
+const getRangeInclusive = async (tn, start, end, level) => {
+    const kvs = await tn.getRangeAll(
+        [level, start], 
+        ks.firstGreaterThan([level, end])
+        );
+
+    return kvs.map(([key, value]) => {
+        return {
+            key,
+            value
+        };
+    });
+}
+
+const getKV = (item) => {
+    const [key, value] = item.value;
+    return {
+        key: key[1],
+        value: value
+    };
+}
+
 const getNext = async (tn, key, level) => {
     const iter = await tn.snapshot().getRange(
         ks.firstGreaterThan([level, key]),
@@ -142,11 +178,7 @@ const getNext = async (tn, key, level) => {
         };
     }
 
-    const [prevKey, prevValue] = item.value;
-    return {
-        key: prevKey[1],
-        value: prevValue
-    };
+    return getKV(item);
 };
 
 const getPrevious = async (tn, key, level) => {
@@ -156,12 +188,50 @@ const getPrevious = async (tn, key, level) => {
         {limit: 1}
     )
 
+    //TODO: add a conflict key
     const item = await iter.next();
-    const [prevKey, prevValue] = item.value;
-    return {
-        key: prevKey[1],
-        value: prevValue
-    };
+    return getKV(item);
+};
+
+const getKeyOrNearest = async (tn, key, level, endkey) => {
+    const _endkey = endkey ? endkey : END;
+    const iter = await tn.snapshot().getRange(
+        ks.firstGreaterOrEqual([level, key]),
+        ks.lastLessThan([level, _endkey]),
+        {limit: 1}
+    )
+    
+    //TODO: add a conflict key
+    const item = await iter.next();
+    if (item.done) {
+        // return {
+        //     key: null,
+        //     value: 0
+        // };
+        return null;
+    }
+
+    return getKV(item);
+};
+
+const getKeyOrFirstBefore = async (tn, key, level) => {
+    const iter = await tn.snapshot().getRange(
+        [level, '0'],
+        [level, key],
+        {limit: 1, reverse: true}
+    )
+    
+    //TODO: add a conflict key
+    const item = await iter.next();
+    if (item.done) {
+        // return {
+        //     key: null,
+        //     value: 0
+        // };
+        return null;
+    }
+
+    return getKV(item);
 };
 
 const print = async () => {
@@ -187,12 +257,98 @@ const print = async () => {
             assert.equal(levelTotal, total, `Level ${level} values not equal`);
         }
     });
+
+    return {
+        total
+    };
+};
+
+const traverse = async (tn, level, current, endkey, acc) => {
+    console.log('END', endkey);
+    const nearestLevelUp = await getKeyOrNearest(tn, current.key, level + 1, endkey.key);
+    console.log('levelup', level, current, nearestLevelUp);
+    if (nearestLevelUp !== null && nearestLevelUp.key === current.key) {
+        // go another level up
+        return await traverse(tn, level + 1, current, endkey, acc);
+    } else {
+        const rangeEndKey = nearestLevelUp === null ? endkey.key : nearestLevelUp.key;
+        const results = await getRangeInclusive(tn, current.key, rangeEndKey, level);
+        // const results = await getRange(tn, current.key, rangeEndKey, level);
+        const vals = results.map(r => r.value);
+        const reduceVals = rereduce(vals);
+        acc.push(reduceVals);
+
+        if (nearestLevelUp === null || nearestLevelUp.key === endkey.key) {
+            return rereduce(acc);
+        }
+
+        return traverse(tn, level + 1, nearestLevelUp, endkey, acc);
+    }
+}
+
+const query = async (opts) => {
+    return await db.doTransaction(async tn => {
+        let endkey = {key: END, value: 0};
+        if (opts.group_level === 0 && !opts.startkey) {
+                const results = await getRange(tn, '0', END, MAX_LEVELS);
+                if (results.length > 1) {
+                    const vals = results.map(kv => kv.value);
+                    const total = rereduce(vals);
+                    return {
+                        key: null,
+                        value: total
+                    };
+                }
+
+                return {
+                    key: null,
+                    value: results[0].value
+                }
+        }
+
+        if (opts.endkey) {
+            endkey = await getKeyOrFirstBefore(tn, JSON.stringify(opts.endkey), 0);
+            console.log('2019,03,1,end', opts.endkey, endkey);
+        }
+
+        if (opts.group_level === 0 && opts.startkey) {
+            const startkey = await getKeyOrNearest(tn, JSON.stringify(opts.startkey), 0);
+            const results = await traverse(tn, 0, startkey, endkey, []);
+            console.log('final results', results);
+            return {
+                key: null,
+                value: results
+            };
+        }
+    });
 };
 
 const run = async () => {
     await clear();
     await create();
     await print();
+
+    // const result = await query({group_level: 0});
+    // assert(info.total, result.value);
+    // console.log('GROUP_LEVEL = 0', result);
+
+    // const result2 = await query({group_level:0, startkey: [2018, 03, 2]});
+    // assert.deepEqual(result2, {
+    //     key: null,
+    //     value: 31
+    // });
+
+    const result3 = await query({
+        group_level: 0,
+        startkey: [2018, 03, 2],
+        endkey: [2019, 03, 2],
+
+    })
+
+    assert.deepEqual(result3, {
+        key: null,
+        value: 18
+    });
 };
 
 run();
