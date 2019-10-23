@@ -446,7 +446,6 @@ const insert = async (tn, key, value) => {
 
             // calculate new nodes values
             const next = await getNext(tn, key, level);
-            // const newRange = await getRange(tn, [...key, END], next.key, lowerLevel);
             const newRange = await getRange(tn, key, next.key, lowerLevel);
             const newValues = newRange.map(kv => kv.value);
             const newValue = rereduce(newValues);
@@ -656,7 +655,6 @@ const query = async (opts) => {
 
 
         const results = await traverse(tn, 0, 0, startkey, endkey, opts.group_level, []);
-        log('final results', results);
         console.log('query stats', util.inspect(stats, {depth: null}));
         return formatResult(results);
     });
@@ -844,7 +842,6 @@ const run = async () => {
     await clear();
     await create();
     await print();
-    // setTimeout(() => process.exit(), 50);
     await simpleQueries();
     await createLots();
     await print();
