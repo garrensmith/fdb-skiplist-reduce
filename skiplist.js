@@ -1,3 +1,9 @@
+/* To run locally
+    npm install foundationdb
+    node skiplist
+*/
+
+
 const assert = require('assert');
 const util = require('util');
 const fdb = require('foundationdb');
