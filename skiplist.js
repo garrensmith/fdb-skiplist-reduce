@@ -4,7 +4,7 @@ const fdb = require('foundationdb');
 const ks = require('foundationdb').keySelector;
 
 // CONSTANTS
-const SHOULD_LOG = false;
+const SHOULD_LOG = true;
 const PREFIX = 'skiplist';
 const MAX_LEVELS = 6;
 const LEVEL_FAN_POW = 1; // 2^X per level or (1 / 2^X) less than previous level
@@ -15,6 +15,9 @@ const db = fdb.openSync()
   .at(PREFIX) // database prefix for all operations
   .withKeyEncoding(fdb.encoders.tuple)
   .withValueEncoding(fdb.encoders.json); // automatically encode & decode values using JSON
+
+// Data model
+// (level, key) = reduce_value
 
 
 const log = (...args) => {
@@ -394,13 +397,29 @@ const createLots = async () => {
     console.timeEnd('total insert');
 }
 
-// The insert algorithm
+/* The insert algorithm
+ Works as follows:
+ Level 0:
+ * Always insert,
+ * if key already exists at level 0, then rereduce two values and insert
+ At level's > 0
+ * Get previous kv at level
+ * If hashCalc is true, key should be inserted at level
+ * So need to recalculate previous keys value,
+ * Get range from level below from previous key to current key
+ * Rereduce those kvs and update previous key's value
+ * Then get next key after current key at level
+ * Use that to get range from current key to next key at level below
+ * Rereduce those values to create value for current key
+ 
+ * If hashCalc is false, key is not inserted at level
+ * So rereduce previous key's value with current key's value and update previous kv
+*/
 const insert = async (tn, key, value) => {
     let currentVal = value; // if this k/v has been stored before we need to update this value at level 0 to be used through the other levels
     for(let level = 0; level <= MAX_LEVELS; level++) {
         if (level === 0) {
             const existing = await getVal(tn, key, level);
-            log('ff', key, currentVal, existing);
             if (existing) {
                 currentVal = rereduce([existing, currentVal]);
             }
@@ -408,11 +427,7 @@ const insert = async (tn, key, value) => {
             continue;
         }
         const previous = await getPrevious(tn, key, level);
-        const tt = await tn.getRangeAll(
-            ks.lastLessThan([level, key]),
-            ks.firstGreaterOrEqual([level, key]),
-        );
-        log(level, 'key', key, 'full previous', tt, 'previous is', previous);
+        log('Planning to insert at ', level, 'key', key, 'previous is', previous);
         if (hashCalc(key, level, LEVEL_FAN_POW)) {
             const lowerLevel = level - 1;
             // update previous node
@@ -470,13 +485,27 @@ const print = async () => {
 };
 
 
-// Skip list query algorithm
-const getNextRangeAndLevel = async (tn, groupLevel, level, prevLevel, startkey, endkey) => {
+// Determines which level and the range the skiplist traversal can do next
+/* Works as follows:
+    * Get the final key for a group level from level 0 - ideally this algorithm looks to scan at the highest level possible
+      and we need this grouplevel endkey to know how far we can possibly scan
+    * If group end key is greater than endkey, send key to groupEndkey
+    * `levelRanges` is used to keep an array of possible ranges we could use scan. Level 0 is always added
+    * At the for loop, start at level 0, and look at the level one above and see if the startkey exists in that level
+    * If the startkey does, also find the group level endkey for that level
+*/
+const getNextRangeAndLevel = async (tn, groupLevel, level, startkey, endkey) => {
     let groupEndkey = await getGroupLevelEndKey(tn, groupLevel, 0, startkey.key);
-    log('groupendkey', groupEndkey, 'end', endkey, keyGreater(endkey, groupEndkey));
+    log('groupendkey', groupEndkey, 'start', startkey, 'end', endkey, keyGreater(endkey, groupEndkey));
     if (keyGreater(endkey, groupEndkey)) {
         groupEndkey = endkey;
     }
+
+    // if (keysEqual(startkey, groupEndkey)) {
+    //     log("BOOM EQUAL");
+    //     return [0, startkey, startkey];
+    // }
+
     log('LEVEL 0 searc', startkey, groupEndkey);
     const levelRanges = [{
         level: 0,
@@ -498,7 +527,7 @@ const getNextRangeAndLevel = async (tn, groupLevel, level, prevLevel, startkey, 
                     // exceeded the range at this level we can't go further
                     break;
                 }
-                // end of section have to do the read at level 0
+                // end of grouplevel have to do the read at level 0
                 if (keysEqual(nearestLevelKey, groupLevelEndKey)) {
                     return [0, nearestLevelKey, nearestLevelKey];
                 }
@@ -524,23 +553,37 @@ const getNextRangeAndLevel = async (tn, groupLevel, level, prevLevel, startkey, 
     return [out.level, out.start, out.end]
 };
 
+// Main algorithm to traverse the skip list
+/* Algorithm works as follows:
+    * calls getNextRangeAndLevel to determine what to scan
+    * Gets all values in that range for set level including endkey
+    * Final value in range is used as the next startkey
+    * Collates and Rereduces all values collected
+    * If there is no new startkey or rangeEnd = endkey at we scanned at level 0 then we done
+    * Otherwise start again at level 0 and continue traversal
+*/
 const traverse = async (tn, level, prevLevel, current, endkey, groupLevel, acc) => {
     if (level < 0) {
         throw new Error("gone to low");
     }
-    const [rangeLevel, rangeStart, rangeEnd] = await getNextRangeAndLevel(tn, groupLevel, level, prevLevel, current, endkey);
-    log('RANGE QUERY, level', rangeLevel, 'start', rangeStart, 'end', rangeEnd);
+    const [rangeLevel, rangeStart, rangeEnd] = await getNextRangeAndLevel(tn, groupLevel, level, current, endkey);
+    log('traversing, level', rangeLevel, 'start', rangeStart, 'end', rangeEnd);
 
+    // simple stats to keep track of which levels are used the most
     stats[rangeLevel].push([rangeStart.key, rangeEnd.key]);
     const results = await getRangeInclusive(tn, rangeStart.key, rangeEnd.key, rangeLevel);
     log('RESULTS', results, 'start', rangeStart.key, 'end', rangeEnd.key);
     // test with rangeEnd always next startkey
     let nextStartKey = results[results.length - 1];
+    // let nextStartKey1 = await getKeyAfter(tn, nextStartKey.key, rangeLevel, endkey.key);
+    // if (!groupLevelEqual(nextStartKey, nextStartKey1)) {
+
+    // }
     const useableResults = results.slice(0, results.length -1);
     acc = [...acc, ...useableResults];
     if (rangeLevel === 0) {
         acc.push(nextStartKey);
-        log('COLLATE', acc);
+        log('collating and reducing', acc);
         const reducedResults = collateRereduce(acc, groupLevel);
         acc = reducedResults;
         nextStartKey = await getKeyAfter(tn, nextStartKey.key, rangeLevel, endkey.key);
@@ -550,12 +593,12 @@ const traverse = async (tn, level, prevLevel, current, endkey, groupLevel, acc) 
         }
     }
 
-    log('END EQUAL', 'rangend', rangeEnd, 'end', endkey, keysEqual(rangeEnd, endkey));
+    // Reached the end of the query, return results
     if ((keysEqual(rangeEnd, endkey) || nextStartKey === null) && rangeLevel === 0) {
         return acc;
     }
 
-    log('moving next rangeLevel', rangeLevel, 'newStart', nextStartKey, acc);
+    log('moving next traversal', rangeLevel, 'newStart', nextStartKey, acc);
     return traverse(tn, 0, rangeLevel, nextStartKey, endkey, groupLevel, acc);
 }
 
@@ -622,90 +665,90 @@ const query = async (opts) => {
 // this is used to varify the accuracy of the insert and query
 const simpleQueries = async () => {
     let result = {};
-    result = await query({group_level: 0});
-    assert.deepEqual(result, {
-        rows: [{
-            key: null,
-            value: 68
-        }]
-    });
+    // result = await query({group_level: 0});
+    // assert.deepEqual(result, {
+    //     rows: [{
+    //         key: null,
+    //         value: 68
+    //     }]
+    // });
 
-    result = await query({group_level:0, startkey: [2018, 3, 2]});
-    assert.deepEqual(result, {
-        rows: [{
-            key: null,
-            value: 31
-        }]
-    });
+    // result = await query({group_level:0, startkey: [2018, 3, 2]});
+    // assert.deepEqual(result, {
+    //     rows: [{
+    //         key: null,
+    //         value: 31
+    //     }]
+    // });
 
-    result = await query({
-        group_level:0,
-        startkey: [2018, 3, 2],
-        endkey: [2019, 5, 1]
-    });
-    assert.deepEqual(result, {
-        rows: [{
-            key: null,
-            value: 31
-        }]
-    });
+    // result = await query({
+    //     group_level:0,
+    //     startkey: [2018, 3, 2],
+    //     endkey: [2019, 5, 1]
+    // });
+    // assert.deepEqual(result, {
+    //     rows: [{
+    //         key: null,
+    //         value: 31
+    //     }]
+    // });
 
-    result = await query({
-        group_level: 0,
-        startkey: [2018, 03, 2],
-        endkey: [2019, 03, 2],
+    // result = await query({
+    //     group_level: 0,
+    //     startkey: [2018, 03, 2],
+    //     endkey: [2019, 03, 2],
 
-    })
+    // })
 
-    assert.deepEqual(result, {
-        rows: [{
-            key: null,
-            value: 18
-        }]
-    });
+    // assert.deepEqual(result, {
+    //     rows: [{
+    //         key: null,
+    //         value: 18
+    //     }]
+    // });
 
-    result = await query({
-        group_level: 1,
-        startkey: [2017, 4, 1],
-        endkey: [2018, 3, 1],
-    })
+    // result = await query({
+    //     group_level: 1,
+    //     startkey: [2017, 4, 1],
+    //     endkey: [2018, 3, 1],
+    // })
 
-    assert.deepEqual(result, {
-        rows: [
-        {
-            key: [2017],
-            value: 22
-        },
-        {
-            key: [2018],
-            value: 6
-        }
-    ]
-    });
+    // assert.deepEqual(result, {
+    //     rows: [
+    //     {
+    //         key: [2017],
+    //         value: 22
+    //     },
+    //     {
+    //         key: [2018],
+    //         value: 6
+    //     }
+    // ]
+    // });
 
-    result = await query({
-        group_level: 1,
-        startkey: [2017, 4, 1],
-        endkey: [2019, 03, 2],
+    // result = await query({
+    //     group_level: 1,
+    //     startkey: [2017, 4, 1],
+    //     endkey: [2019, 03, 2],
 
-    })
+    // })
 
-    assert.deepEqual(result, {
-        rows: [
-        {
-            key: [2017],
-            value: 22
-        },
-        {
-            key: [2018],
-            value: 20
-        },
-        {
-            key: [2019],
-            value: 4
-        }
-    ]
-    });
+    // assert.deepEqual(result, {
+    //     rows: [
+    //     {
+    //         key: [2017],
+    //         value: 22
+    //     },
+    //     {
+    //         key: [2018],
+    //         value: 20
+    //     },
+    //     {
+    //         key: [2019],
+    //         value: 4
+    //     }
+    // ]
+    // });
 
     result = await query({
         group_level: 1,
@@ -731,17 +774,17 @@ const simpleQueries = async () => {
     ]
     });
 
-    result = await query({
-        group: true,
-        startkey: [2018, 5, 1],
-        endkey: [2019, 4, 1],
-    });
+    // result = await query({
+    //     group: true,
+    //     startkey: [2018, 5, 1],
+    //     endkey: [2019, 4, 1],
+    // });
 
-    assert.deepEqual(result, {rows: [
-        {key: [2018,5,1], value: 7},
-        {key: [2019,3,1], value: 4},
-        {key: [2019,4,1], value: 6}
-    ]})
+    // assert.deepEqual(result, {rows: [
+    //     {key: [2018,5,1], value: 7},
+    //     {key: [2019,3,1], value: 4},
+    //     {key: [2019,4,1], value: 6}
+    // ]})
     log('SIMPLE DONE');
 };
 
@@ -799,10 +842,11 @@ const run = async () => {
     await clear();
     await create();
     await print();
+    setTimeout(() => process.exit(), 50);
     await simpleQueries();
-    await createLots();
-    await print();
-    await largeQueries();
+    // await createLots();
+    // await print();
+    // await largeQueries();
 };
 
 run();
