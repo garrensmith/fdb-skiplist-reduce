@@ -270,20 +270,20 @@ const getNext = async (tn, key, level) => {
         };
     }
 
-    return getKV(item);
+    const kv = getKV(item);
+    tn.addReadConflictKey([level, kv.key]);
+    return kv;
 };
 
 // Get key after supplied key but doesn't look further than endkey
 const getKeyAfter = async (tn, key, level, endkey) => {
     const _endkey = endkey ? endkey : END;
-    const iter = await tn.snapshot().getRange(
+    const iter = await tn.getRange(
         ks.firstGreaterThan([level, key]),
         ks.firstGreaterThan([level, _endkey]),
-        // ks.lastLessThan([level, _endkey]),
         {limit: 1}
     )
     
-    //TODO: add a conflict key
     const item = await iter.next();
     if (item.done) {
         return null;
@@ -300,22 +300,21 @@ const getPrevious = async (tn, key, level) => {
         {limit: 1}
     )
 
-    //TODO: add a conflict key
     const item = await iter.next();
-    return getKV(item);
+    const kv = getKV(item);
+    tn.addReadConflictKey([level, kv.key]);
+    return kv;
 };
 
 // Get key at level or first one after key
 const getKeyOrNearest = async (tn, key, level, endkey) => {
     const _endkey = endkey ? endkey : END;
-    const iter = await tn.snapshot().getRange(
+    const iter = await tn.getRange(
         ks.firstGreaterOrEqual([level, key]),
         ks.firstGreaterThan([level, _endkey]),
-        // ks.lastLessThan([level, _endkey]),
         {limit: 1}
     )
     
-    //TODO: add a conflict key
     const item = await iter.next();
     if (item.done) {
         return null;
@@ -328,7 +327,7 @@ const getKeyOrNearest = async (tn, key, level, endkey) => {
 const getGroupLevelEndKey = async (tn, groupLevel, level, startkey) => {
     const groupLevelKey = getGroupLevelKey(startkey, groupLevel);
     const end = groupLevelKey === null ? END : [...groupLevelKey, END];
-    const iter = await tn.snapshot().getRange(
+    const iter = await tn.getRange(
         ks.firstGreaterThan([level, groupLevelKey]),
         ks.firstGreaterOrEqual([level, end]),
         {reverse: true, limit: 1}
@@ -345,7 +344,7 @@ const getGroupLevelEndKey = async (tn, groupLevel, level, startkey) => {
 
 // Returns key for level or the first one before it
 const getKeyOrFirstBefore = async (tn, key, level) => {
-    const iter = await tn.snapshot().getRange(
+    const iter = await tn.getRange(
         ks.lastLessThan([level, key]),
         ks.firstGreaterThan([level, key]),
         {limit: 1, reverse: true}
