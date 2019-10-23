@@ -2,30 +2,30 @@ const assert = require('assert');
 const util = require('util');
 const fdb = require('foundationdb');
 const ks = require('foundationdb').keySelector;
-fdb.setAPIVersion(600); // Must be called before database is opened
 
+// CONSTANTS
+const SHOULD_LOG = false;
 const PREFIX = 'skiplist';
+const MAX_LEVELS = 6;
+const LEVEL_FAN_POW = 1; // 2^X per level or (1 / 2^X) less than previous level
+const END = 0xFF;
 
-const db = fdb.openSync() // or openSync('/path/to/fdb.cluster')
+fdb.setAPIVersion(600); // Must be called before database is opened
+const db = fdb.openSync()
   .at(PREFIX) // database prefix for all operations
   .withKeyEncoding(fdb.encoders.tuple)
   .withValueEncoding(fdb.encoders.json); // automatically encode & decode values using JSON
- 
-const MAX_LEVELS = 6;
-const LEVEL_FAN_POW = 2; // 2^X per level or (1 / 2^X) less than previous level
-const END = 0xFF;
 
-let stats;
 
-const SHOULD_LOG = false;
 const log = (...args) => {
     if (!SHOULD_LOG) {
         return;
     }
-
     console.log(...args);
 }
 
+// keep a basic stats of which levels were used for a query
+let stats;
 const resetStats = () => {
     stats = {
         "0": [],
@@ -38,6 +38,7 @@ const resetStats = () => {
     };
 }
 
+// An initial simple set of kvs to insert and query to verify the algoritym
 const kvs = [
     [[2017,3,1], 9],
     [[2017,4,1], 7], 
@@ -64,14 +65,16 @@ const getRandomKey = (min, max) => {
     return [getRandom(min, max), getRandom(1, 12), getRandom(1, 30)];
 }
 
+// Very rough hash algorithm to convert any string to an integer
 function hashCode(s) {
     for(var i = 0, h = 0; i < s.length; i++)
         h = Math.imul(31, h) + s.charCodeAt(i) | 0;
     return h;
 }
 
+// calculation to determine if key should be added to a level
 const hashCalc = (key, level, pow) => {
-    const keyHash = hashCode(key.toString());
+    const keyHash = hashCode(JSON.stringify(key));
     const out = (keyHash & ((1 << (level * pow)) - 1));
     if (out !== 0) {
         return false;
@@ -80,24 +83,277 @@ const hashCalc = (key, level, pow) => {
     return true;
 }
 
+// Basic rereduce function
 // _sum but pretend its more complex
 const rereduce = (values) => {
-    const out = values.reduce((acc, val) => {
+    return values.reduce((acc, val) => {
         return acc + val;
     }, 0);
-
-    // log('rereduce', values, out);
-    return out;
 };
 
-// OPERATIONS
+// Takes all key/values and collates to group level and runs rereduce
+const collateRereduce = (acc, groupLevel) => {
+    const acc1 = acc.reduce((acc, kv) => {
+        const key = getGroupLevelKey(kv.key, groupLevel);
 
+        if (!acc[key]) {
+            acc[key] = {
+                key,
+                values: []
+            };
+        }
+
+        acc[key].values.push(kv.value);
+        return acc;
+    }, {});
+
+    return Object.values(acc1).reduce((acc, kv) => {
+        const values = kv.values;
+        const key = kv.key;
+        const result = rereduce(values);
+
+        acc.push({
+            key,
+            value: result
+        });
+
+        return acc;
+    }, []);
+};
+
+// KEY UTIL FUNCTIONS
+
+// convert key to binary
+const keyToBinary = (one) => {
+    let keyOne = one.key ? one.key : one;
+
+    if (!Array.isArray(keyOne)) {
+        keyOne = [keyOne];
+    }
+
+
+    return Buffer.from(keyOne);
+}
+
+// check keys are equal
+const keysEqual = (one, two) => {
+    if (one === null || two === null) {
+        return false;
+    }
+
+    const binOne = keyToBinary(one);
+    const binTwo = keyToBinary(two);
+
+    return binOne.compare(binTwo) === 0;
+}
+
+// Are keys equal at set group level
+const groupLevelEqual = (one, two, groupLevel) => {
+    if (one === null || two === null) {
+        return false
+    }
+    const levelOne = getGroupLevelKey(one.key, groupLevel);
+    const levelTwo = getGroupLevelKey(two.key, groupLevel);
+
+    return keysEqual(levelOne, levelTwo);
+};
+
+// is key two greater than key one?
+const keyGreater = (one, two) => {
+    if (!one || !two) {
+        return false;
+    }
+
+    const binOne = keyToBinary(one);
+    const binTwo = keyToBinary(two);
+
+    // key two comes after
+    return binOne.compare(binTwo) === -1;
+}
+
+// convert key to group level. e.g Key = [2019,2,5] and group_level = 2
+// returns [2019, 2]
+const getGroupLevelKey = (key, groupLevel) => {
+    if (groupLevel === 0) {
+        return null
+    }
+
+    if (!Array.isArray(key)) {
+        return key;
+    }
+
+    if (key.length <= groupLevel) {
+        return key;
+    }
+
+    return key.slice(0, groupLevel);
+};
+
+// FDB OPERATIONS
+
+// clear full range
 const clear = async () => {
     await db.doTransaction(async tn => {
         tn.clearRangeStartsWith([]);
     });
 }
 
+// get value for key at level
+const getVal = async (tn, key, level) => {
+    return  await tn.get([level, key]);
+}
+
+// add kv to level
+const insertAtLevel = async (tn, key, value, level) => {
+    log('inserting', level, key, ':', value);
+    return await tn.set([level, key], value);
+};
+
+// get all kvs within start/end, exclusive of end key
+const getRange = async (tn, start, end, level) => {
+    const kvs = await tn.getRangeAll([level, start], [level, end]);
+
+    return kvs.map(([[_level, key], value]) => {
+        return {
+            key,
+            value
+        };
+    });
+};
+
+// get all kvs within start/end, inclusive of end
+const getRangeInclusive = async (tn, start, end, level) => {
+    const kvs = await tn.getRangeAll(
+        ks.firstGreaterOrEqual([level, start]), 
+        ks.firstGreaterThan([level, end])
+        );
+
+    return kvs.map(([[_level, key], value]) => {
+        return {
+            key,
+            value
+        };
+    });
+}
+
+// return kv in common format
+const getKV = (item) => {
+    const [key, value] = item.value;
+    return {
+        key: key[1],
+        value: value
+    };
+}
+
+// Get key after supplied key
+const getNext = async (tn, key, level) => {
+    const iter = await tn.snapshot().getRange(
+        ks.firstGreaterThan([level, key]),
+        [level, END],
+        {limit: 1}
+    )
+
+    const item = await iter.next();
+    if (item.done) {
+        return {
+            key: END,
+            value: 0
+        };
+    }
+
+    return getKV(item);
+};
+
+// Get key after supplied key but doesn't look further than endkey
+const getKeyAfter = async (tn, key, level, endkey) => {
+    const _endkey = endkey ? endkey : END;
+    const iter = await tn.snapshot().getRange(
+        ks.firstGreaterThan([level, key]),
+        ks.firstGreaterThan([level, _endkey]),
+        // ks.lastLessThan([level, _endkey]),
+        {limit: 1}
+    )
+    
+    //TODO: add a conflict key
+    const item = await iter.next();
+    if (item.done) {
+        return null;
+    }
+
+    return getKV(item);
+};
+
+// get kv before supplied key
+const getPrevious = async (tn, key, level) => {
+    const iter = await tn.snapshot().getRange(
+        ks.lastLessThan([level, key]),
+        ks.firstGreaterOrEqual([level, key]),
+        {limit: 1}
+    )
+
+    //TODO: add a conflict key
+    const item = await iter.next();
+    return getKV(item);
+};
+
+// Get key at level or first one after key
+const getKeyOrNearest = async (tn, key, level, endkey) => {
+    const _endkey = endkey ? endkey : END;
+    const iter = await tn.snapshot().getRange(
+        ks.firstGreaterOrEqual([level, key]),
+        ks.firstGreaterThan([level, _endkey]),
+        // ks.lastLessThan([level, _endkey]),
+        {limit: 1}
+    )
+    
+    //TODO: add a conflict key
+    const item = await iter.next();
+    if (item.done) {
+        return null;
+    }
+
+    return getKV(item);
+};
+
+// Gets the final key in the set group level
+const getGroupLevelEndKey = async (tn, groupLevel, level, startkey) => {
+    const groupLevelKey = getGroupLevelKey(startkey, groupLevel);
+    const end = groupLevelKey === null ? END : [...groupLevelKey, END];
+    const iter = await tn.snapshot().getRange(
+        ks.firstGreaterThan([level, groupLevelKey]),
+        ks.firstGreaterOrEqual([level, end]),
+        {reverse: true, limit: 1}
+    )
+    
+    //TODO: add a conflict key
+    const item = await iter.next();
+    if (item.done) {
+        return null;
+    }
+
+    return getKV(item);
+};
+
+// Returns key for level or the first one before it
+const getKeyOrFirstBefore = async (tn, key, level) => {
+    const iter = await tn.snapshot().getRange(
+        ks.lastLessThan([level, key]),
+        ks.firstGreaterThan([level, key]),
+        {limit: 1, reverse: true}
+    )
+    
+    //TODO: add a conflict key
+    const item = await iter.next();
+    if (item.done) {
+        return null;
+    }
+
+    return getKV(item);
+};
+
+// SKIP LIST OPERATIONS
+
+//setup skip list and insert the initial kvs
 const create = async () => {
     await db.doTransaction(async tn => {
         for(let level = 0; level <= MAX_LEVELS; level++) {
@@ -113,11 +369,12 @@ const create = async () => {
     }
 };
 
+// inserts a larger amount of keys, 1000 keys per transaction
 const rawKeys = []
 const createLots = async () => {
     const docsPerTx = 1000;
     console.time('total insert');
-    for (let i = 0; i <= 100000; i+= docsPerTx) {
+    for (let i = 0; i <= 10000; i+= docsPerTx) {
         const kvs = [];
         for (let k = 0; k <= docsPerTx; k++) {
             const key = getRandomKey(2015, 2020);
@@ -128,85 +385,16 @@ const createLots = async () => {
         console.time('tx');
         await db.doTransaction(async tn => {
             for ([key, value] of kvs) {
-                // console.time('insert');
                 await insert(tn, key, value);
-                // console.timeEnd('insert');
-                // if (i % 1000 === 0) {
-                //     console.log("\n\n i=", i,"\n\n");
-                // }
             }
         });
         console.timeEnd('tx');
+        log('inserted ${i} keys');
     }
     console.timeEnd('total insert');
-    // console.log('Added keys', rawKeys);
-
-    // const lots = [
-    //     { key: [ 2016, 6, 10 ], value: 15 },
-    //     { key: [ 2017, 4, 8 ], value: 9 },
-    //     { key: [ 2015, 2, 29 ], value: 2 },
-    //     { key: [ 2015, 8, 17 ], value: 15 },
-    //     { key: [ 2018, 10, 13 ], value: 2 },
-    //     { key: [ 2016, 1, 16 ], value: 5 },
-    //     { key: [ 2015, 7, 11 ], value: 8 },
-    //     { key: [ 2016, 1, 27 ], value: 4 },
-    //     { key: [ 2018, 1, 23 ], value: 17 },
-    //     { key: [ 2015, 3, 25 ], value: 17 }
-    // ]
-    // for (kv of lots) {
-    //     await db.doTransaction(async tn => {
-    //         await insert(tn, kv.key, kv.value);
-    //     });
-    // }
-
 }
 
-const insertFromTop = async (tn, key, value) => {
-    let currentVal = value; // if this k/v has been stored before we need to update this value at level 0 to be used through the other levels
-    let level = 0;
-    const existing = await getVal(tn, key, level);
-    log('ff', key, currentVal, existing);
-    if (existing) {
-        currentVal = rereduce([existing, currentVal]);
-    }
-    await insertAtLevel(tn, key, currentVal, 0);
-
-    for(level = MAX_LEVELS; level > 0; level--) {
-        const previous = await getPrevious(tn, key, level);
-        const tt = await tn.getRangeAll(
-            ks.lastLessThan([level, key]),
-            ks.firstGreaterOrEqual([level, key]),
-        );
-        log(level, 'key', key, 'full previous', tt, 'previous is', previous);
-        if (hashCalc(key, level, LEVEL_FAN_POW)) {
-            const lowerLevel = level - 1;
-            // update previous node
-            const newPrevRange = await getRange(tn, previous.key, key, lowerLevel);
-            log('prevRange', newPrevRange, 'prevKey', previous, 'key', key);
-            const prevValues = newPrevRange.map(kv => kv.value);
-            const newPrevValue = rereduce(prevValues)
-            if (newPrevValue !== previous.value) {
-                await insertAtLevel(tn, previous.key, newPrevValue, level);
-            }
-
-            // calculate new nodes values
-            const next = await getNext(tn, key, level);
-            // const newRange = await getRange(tn, [...key, END], next.key, lowerLevel);
-            const newRange = await getRange(tn, key, next.key, lowerLevel);
-            const newValues = newRange.map(kv => kv.value);
-            const newValue = rereduce(newValues);
-            log('inserting at level', level, 'key', key, 'after', next, 'range', newRange);
-            await insertAtLevel(tn, key, newValue, level);
-        } else {
-            const newValue = rereduce([previous.value, value]);
-            log('rereduce at', level, 'key', previous.key, 'new value', newValue, 'prev value', previous.value);
-            await insertAtLevel(tn, previous.key, newValue, level);
-        }
-    }
-
-
-}
-
+// The insert algorithm
 const insert = async (tn, key, value) => {
     let currentVal = value; // if this k/v has been stored before we need to update this value at level 0 to be used through the other levels
     for(let level = 0; level <= MAX_LEVELS; level++) {
@@ -252,160 +440,8 @@ const insert = async (tn, key, value) => {
     }
 };
 
-const insertAtLevel = async (tn, key, value, level) => {
-    log('INS', level, key, ':', value);
-    return await tn.set([level, key], value);
-};
-
-const getRange = async (tn, start, end, level) => {
-    const kvs = await tn.getRangeAll([level, start], [level, end]);
-
-    return kvs.map(([[_level, key], value]) => {
-        return {
-            key,
-            value
-        };
-    });
-};
-
-const getRangeInclusive = async (tn, start, end, level) => {
-    const kvs = await tn.getRangeAll(
-        ks.firstGreaterOrEqual([level, start]), 
-        ks.firstGreaterThan([level, end])
-        );
-
-    return kvs.map(([[_level, key], value]) => {
-        return {
-            key,
-            value
-        };
-    });
-}
-
-const getKV = (item) => {
-    const [key, value] = item.value;
-    return {
-        key: key[1],
-        value: value
-    };
-}
-
-const getVal = async (tn, key, level) => {
-    return  await tn.get([level, key]);
-}
-
-const getNext = async (tn, key, level) => {
-    const iter = await tn.snapshot().getRange(
-        ks.firstGreaterThan([level, key]),
-        [level, END],
-        {limit: 1}
-    )
-
-    const item = await iter.next();
-    if (item.done) {
-        return {
-            key: END,
-            value: 0
-        };
-    }
-
-    return getKV(item);
-};
-
-const getPrevious = async (tn, key, level) => {
-    const iter = await tn.snapshot().getRange(
-        ks.lastLessThan([level, key]),
-        ks.firstGreaterOrEqual([level, key]),
-        {limit: 1}
-    )
-
-    //TODO: add a conflict key
-    const item = await iter.next();
-    return getKV(item);
-};
-
-const getKeyOrNearest = async (tn, key, level, endkey) => {
-    const _endkey = endkey ? endkey : END;
-    const iter = await tn.snapshot().getRange(
-        ks.firstGreaterOrEqual([level, key]),
-        ks.firstGreaterThan([level, _endkey]),
-        // ks.lastLessThan([level, _endkey]),
-        {limit: 1}
-    )
-    
-    //TODO: add a conflict key
-    const item = await iter.next();
-    if (item.done) {
-        // return {
-        //     key: null,
-        //     value: 0
-        // };
-        return null;
-    }
-
-    return getKV(item);
-};
-
-const getKeyAfter = async (tn, key, level, endkey) => {
-    const _endkey = endkey ? endkey : END;
-    const iter = await tn.snapshot().getRange(
-        ks.firstGreaterThan([level, key]),
-        ks.firstGreaterThan([level, _endkey]),
-        // ks.lastLessThan([level, _endkey]),
-        {limit: 1}
-    )
-    
-    //TODO: add a conflict key
-    const item = await iter.next();
-    if (item.done) {
-        // return {
-        //     key: null,
-        //     value: 0
-        // };
-        return null;
-    }
-
-    return getKV(item);
-};
-
-const getGroupLevelEndKey = async (tn, groupLevel, level, startkey) => {
-    const groupLevelKey = getGroupLevelKey(startkey, groupLevel);
-    const end = groupLevelKey === null ? END : [...groupLevelKey, END];
-    const iter = await tn.snapshot().getRange(
-        ks.firstGreaterThan([level, groupLevelKey]),
-        ks.firstGreaterOrEqual([level, end]),
-        {reverse: true, limit: 1}
-    )
-    
-    //TODO: add a conflict key
-    const item = await iter.next();
-    if (item.done) {
-        // return {
-        //     key: null,
-        //     value: 0
-        // };
-        return null;
-    }
-
-    return getKV(item);
-};
-
-const getKeyOrFirstBefore = async (tn, key, level) => {
-    const iter = await tn.snapshot().getRange(
-        ks.lastLessThan([level, key]),
-        ks.firstGreaterThan([level, key]),
-        {limit: 1, reverse: true}
-    )
-    
-    //TODO: add a conflict key
-    const item = await iter.next();
-    if (item.done) {
-        return null;
-    }
-
-    return getKV(item);
-};
-
+// A simple print that will show all keys at set levels and verify that the values at each level
+// sum up to the values at level = 0
 const print = async () => {
     let total = 0;
     await db.doTransaction(async tn => {
@@ -433,95 +469,8 @@ const print = async () => {
     };
 };
 
-const keyToBinary = (one) => {
-    let keyOne = one.key ? one.key : one;
 
-    if (!Array.isArray(keyOne)) {
-        keyOne = [keyOne];
-    }
-
-
-    return Buffer.from(keyOne);
-}
-
-const keysEqual = (one, two) => {
-    if (one === null || two === null) {
-        return false;
-    }
-
-    const binOne = keyToBinary(one);
-    const binTwo = keyToBinary(two);
-
-    return binOne.compare(binTwo) === 0;
-}
-
-const groupLevelEqual = (one, two, groupLevel) => {
-    if (one === null || two === null) {
-        return false
-    }
-    const levelOne = getGroupLevelKey(one.key, groupLevel);
-    const levelTwo = getGroupLevelKey(two.key, groupLevel);
-
-    return keysEqual(levelOne, levelTwo);
-};
-
-const keyGreater = (one, two) => {
-    if (!one || !two) {
-        return false;
-    }
-
-    const binOne = keyToBinary(one);
-    const binTwo = keyToBinary(two);
-
-    // key two comes after
-    return binOne.compare(binTwo) === -1;
-}
-
-const getGroupLevelKey = (key, groupLevel) => {
-    if (groupLevel === 0) {
-        return null
-    }
-
-    if (!Array.isArray(key)) {
-        return key;
-    }
-
-    if (key.length <= groupLevel) {
-        return key;
-    }
-
-    return key.slice(0, groupLevel);
-};
-
-const collateRereduce = (acc, groupLevel) => {
-    const acc1 = acc.reduce((acc, kv) => {
-        const key = getGroupLevelKey(kv.key, groupLevel);
-
-        if (!acc[key]) {
-            acc[key] = {
-                key,
-                values: []
-            };
-        }
-
-        acc[key].values.push(kv.value);
-        return acc;
-    }, {});
-
-    return Object.values(acc1).reduce((acc, kv) => {
-        const values = kv.values;
-        const key = kv.key;
-        const result = rereduce(values);
-
-        acc.push({
-            key,
-            value: result
-        });
-
-        return acc;
-    }, []);
-};
-
+// Skip list query algorithm
 const getNextRangeAndLevel = async (tn, groupLevel, level, prevLevel, startkey, endkey) => {
     let groupEndkey = await getGroupLevelEndKey(tn, groupLevel, 0, startkey.key);
     log('groupendkey', groupEndkey, 'end', endkey, keyGreater(endkey, groupEndkey));
@@ -610,12 +559,15 @@ const traverse = async (tn, level, prevLevel, current, endkey, groupLevel, acc) 
     return traverse(tn, 0, rangeLevel, nextStartKey, endkey, groupLevel, acc);
 }
 
+// simple formatter to mimic CouchDb response
 const formatResult = (results) => {
     return {
         rows: results
     };
 };
 
+
+// query function to set correct startkey/endkey and call correct query algorithm
 const query = async (opts) => {
     resetStats();
     return await db.doTransaction(async tn => {
@@ -666,6 +618,8 @@ const query = async (opts) => {
 };
 
 
+// smaller queries with the initial kvs added to the skiplist
+// this is used to varify the accuracy of the insert and query
 const simpleQueries = async () => {
     let result = {};
     result = await query({group_level: 0});
@@ -791,6 +745,7 @@ const simpleQueries = async () => {
     log('SIMPLE DONE');
 };
 
+// Fetch all level 0 kvs for a query and produce the correct result
 const queryLevel0 = async (opts) => {
     return await db.doTransaction(async tn => {
         let endkey = {key: END, value: 0};
@@ -809,6 +764,8 @@ const queryLevel0 = async (opts) => {
     });
 }
 
+// Perform a full range scan on the skip list and compare the performance versus 
+// just reading from level 0
 const largeQueries = async () => {
     let result;
     const [startkey, endkey] = await db.doTransaction(async tn => {
@@ -818,12 +775,11 @@ const largeQueries = async () => {
         return [start.key, end.key];
     });
 
-    for (let i = 0; i < 100; i++) {
-        // const endkey = getRandomKey(startkey[0] + 1, 2020);
+    for (let i = 0; i < 10; i++) {
         const opts = {
             group_level: 1,
-            startkey,//: [2016, 1, 7],
-            endkey//: [2018, 7, 8]
+            startkey,
+            endkey
         };
         console.log('range', startkey, endkey);
         console.time('query');
@@ -837,13 +793,15 @@ const largeQueries = async () => {
     }
 };
 
+
+// run function
 const run = async () => {
-    // await clear();
-    // await create();
-    // await print();
-    // await simpleQueries();
-    // await createLots();
-    // await print();
+    await clear();
+    await create();
+    await print();
+    await simpleQueries();
+    await createLots();
+    await print();
     await largeQueries();
 };
 

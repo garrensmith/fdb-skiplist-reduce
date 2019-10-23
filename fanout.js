@@ -1,5 +1,3 @@
-
-
 const MAX_LEVELS = 10;
 const LEVEL_FAN_POW = 4; // 2^X per level or (1 / 2^X) less than previous level
 const items = 300000;
